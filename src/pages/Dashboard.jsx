@@ -247,6 +247,118 @@ function getCheckSquare(chess) {
   return kingSquares[0] || undefined
 }
 
+// ─── Move tree (variation support) ──────────────────────────────────────────────
+// Each node: { san, moveObj, fen, children: [], parent: node|null }
+// Root node has san=null, moveObj=null, fen=starting position.
+// children[0] is always the mainline continuation; children[1..n] are variations.
+
+function createRootNode(fen) {
+  return { san: null, moveObj: null, fen: fen || new Chess().fen(), children: [], parent: null }
+}
+
+// Add a move as a child of parentNode. If a child with the same SAN already exists,
+// return that existing child instead (no duplicate branches).
+function addMoveToTree(parentNode, moveObj) {
+  const existing = parentNode.children.find(c => c.san === moveObj.san)
+  if (existing) return existing
+  const node = {
+    san: moveObj.san,
+    moveObj,
+    fen: moveObj.after,
+    children: [],
+    parent: parentNode,
+  }
+  parentNode.children.push(node)
+  return node
+}
+
+// Walk from a node back to root and return the path of SAN strings (for opening tree lookup)
+function getPathSans(node) {
+  const sans = []
+  let cur = node
+  while (cur && cur.san !== null) {
+    sans.unshift(cur.san)
+    cur = cur.parent
+  }
+  return sans
+}
+
+// Get the mainline (first-child path) as an array of nodes starting from root's first child
+function getMainline(root) {
+  const nodes = []
+  let cur = root
+  while (cur.children.length > 0) {
+    cur = cur.children[0]
+    nodes.push(cur)
+  }
+  return nodes
+}
+
+// Flatten the tree into a notation structure for rendering.
+// Returns an array of "tokens" for inline PGN-style display:
+//   { type: 'move', node, halfMoveIdx, moveNumber, isBlack }
+//   { type: 'varStart' }  — opening parenthesis
+//   { type: 'varEnd' }    — closing parenthesis
+//   { type: 'moveNumber', num, dots }  — e.g. "3." or "3..."
+function flattenTreeForDisplay(root) {
+  const tokens = []
+
+  function emitMoveNumber(hm) {
+    const moveNum = Math.floor(hm / 2) + 1
+    const isBlack = hm % 2 === 1
+    if (!isBlack) {
+      tokens.push({ type: 'moveNumber', num: moveNum, dots: '.' })
+    }
+  }
+
+  function emitBlackMoveNumber(hm) {
+    const moveNum = Math.floor(hm / 2) + 1
+    tokens.push({ type: 'moveNumber', num: moveNum, dots: '...' })
+  }
+
+  function walk(node, startHalfMove) {
+    let hm = startHalfMove
+    let cur = node
+    while (cur) {
+      // Emit move number for white moves, or after variation start
+      emitMoveNumber(hm)
+
+      tokens.push({
+        type: 'move',
+        node: cur,
+        halfMoveIdx: hm,
+        moveNumber: Math.floor(hm / 2) + 1,
+        isBlack: hm % 2 === 1,
+      })
+
+      // Emit variations (children[1..n]) before continuing mainline
+      if (cur.children.length > 1) {
+        for (let v = 1; v < cur.children.length; v++) {
+          tokens.push({ type: 'varStart' })
+          // Variation starts at the *next* half-move
+          const varHm = hm + 1
+          if (varHm % 2 === 1) {
+            // Variation starts with black move — emit "N..."
+            emitBlackMoveNumber(varHm)
+          }
+          walk(cur.children[v], varHm)
+          tokens.push({ type: 'varEnd' })
+        }
+      }
+
+      hm++
+      // Continue along mainline (first child)
+      cur = cur.children.length > 0 ? cur.children[0] : null
+    }
+  }
+
+  if (root.children.length > 0) {
+    walk(root.children[0], 0)
+  }
+
+  return tokens
+}
+
 // ─── KPI tile (shadcn-style) ────────────────────────────────────────────────────
 const KpiCard = ({ icon: Icon, iconColor, bg, label, value, sub }) => (
   <Card className="border-border bg-card/50 backdrop-blur-sm rounded-lg border shadow-sm hover:shadow-md transition-shadow">
@@ -388,17 +500,38 @@ function Dashboard() {
   const cgRef = useRef(null)
   const chessRef = useRef(new Chess())
   const historyRef = useRef(null)
+  const mobileHistoryRef = useRef(null)
   const [orientation, setOrientation] = useState('white')
-  const [moveHistory, setMoveHistory] = useState([])
   const [status, setStatus] = useState('')
   const [promotionPending, setPromotionPending] = useState(null)
 
-  // ── Move navigation state ──────────────────────────────────────────────
-  // gameHistory stores verbose move objects for replaying positions.
-  // viewIndex: null = viewing live (latest) position, number = viewing
-  // position after half-move N (0-indexed). Use -1 for the start position.
-  const gameHistoryRef = useRef([])
-  const [viewIndex, setViewIndex] = useState(null)
+  // ── Move tree state (supports variations) ──────────────────────────────
+  // moveTreeRef holds the root of the variation tree.
+  // currentNodeRef points to the node of the currently displayed position.
+  // For the starting position, currentNodeRef === moveTreeRef (the root).
+  // treeVersion is bumped to trigger React re-renders when the tree mutates.
+  const moveTreeRef = useRef(createRootNode())
+  const currentNodeRef = useRef(moveTreeRef.current)
+  const [treeVersion, setTreeVersion] = useState(0)
+  // Whether we're viewing a historical position (not the end of the current line)
+  const [isViewingHistory, setIsViewingHistory] = useState(false)
+
+  // Derive moveHistory (flat SAN array from root to currentNode) for opening tree compatibility
+  const moveHistory = useMemo(() => {
+    // eslint-disable-next-line no-unused-vars
+    const _v = treeVersion // subscribe to tree changes
+    return getPathSans(currentNodeRef.current)
+  }, [treeVersion])
+
+  // Derive mainline nodes for notation tokens
+  const notationTokens = useMemo(() => {
+    // eslint-disable-next-line no-unused-vars
+    const _v = treeVersion // subscribe to tree changes
+    return flattenTreeForDisplay(moveTreeRef.current)
+  }, [treeVersion])
+
+  // Helper to bump tree version (forces re-render after tree mutation)
+  const bumpTree = useCallback(() => setTreeVersion(v => v + 1), [])
 
   // ── Preferences (persisted) ────────────────────────────────────────────
   const initialPrefs = useRef(loadPrefs())
@@ -633,8 +766,8 @@ function Dashboard() {
     // Account for eval bar (34px = 26px bar + 8px gap) when engine is on
     const evalOffset = engineOn ? ' - 34px' : ''
     return {
-      width: `min(calc(100vh - 12rem), min(calc(80vw${evalOffset}), 560px))`,
-      height: `min(calc(100vh - 12rem), min(calc(80vw${evalOffset}), 560px))`,
+      width: `min(calc(100vh - 12rem), min(calc(100vw - 3rem${evalOffset}), 560px))`,
+      height: `min(calc(100vh - 12rem), min(calc(100vw - 3rem${evalOffset}), 560px))`,
     }
   }, [computedBoardSize, engineOn])
 
@@ -692,28 +825,15 @@ function Dashboard() {
     }
   }, [boardSize])
 
-  // Stats derived from move history
+  // Stats derived from the current path in the move tree
   const stats = useMemo(() => {
-    const chess = chessRef.current
-    const history = chess.history({ verbose: true })
-    const captures = history.filter(m => m.isCapture()).length
-    const checks = history.filter(m => m.san.includes('+')).length
-    const moveNum = Math.ceil(moveHistory.length / 2)
-    return { captures, checks, moveNum, halfMoves: moveHistory.length }
-  }, [moveHistory])
-
-  // Compute paired moves for display
-  const movePairs = useMemo(() => {
-    const pairs = []
-    for (let i = 0; i < moveHistory.length; i += 2) {
-      pairs.push({
-        num: Math.floor(i / 2) + 1,
-        white: moveHistory[i],
-        black: moveHistory[i + 1] || null,
-      })
-    }
-    return pairs
-  }, [moveHistory])
+    const pathSans = moveHistory
+    const mainline = getMainline(moveTreeRef.current)
+    const captures = mainline.filter(n => n.moveObj && n.moveObj.captured).length
+    const checks = mainline.filter(n => n.san && n.san.includes('+')).length
+    const moveNum = Math.ceil(pathSans.length / 2)
+    return { captures, checks, moveNum, halfMoves: mainline.length }
+  }, [moveHistory, treeVersion]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const updateStatus = useCallback(() => {
     const chess = chessRef.current
@@ -756,31 +876,38 @@ function Dashboard() {
     updateStatus()
   }, [updateStatus])
 
-  // Show a specific position on the board (view-only, no moves allowed)
+  // Show a specific position on the board (allows moves for creating variations)
   const showPosition = useCallback((fen, lastMoveSquares) => {
     const cg = cgRef.current
     if (!cg) return
 
     const chess = new Chess(fen)
+    // Load the position into chessRef so makeMove can validate from it
+    chessRef.current.load(fen)
+
+    const color = turnColor(chess)
+    const isOver = chess.isGameOver()
 
     cg.set({
       fen,
-      turnColor: turnColor(chess),
+      turnColor: color,
       check: getCheckSquare(chess),
       lastMove: lastMoveSquares || undefined,
       movable: {
         free: false,
-        color: undefined,
-        dests: new Map(),
+        color: isOver ? undefined : color,
+        dests: isOver ? new Map() : getLegalDests(chess),
       },
     })
   }, [])
 
   const makeMove = useCallback((orig, dest, promotion) => {
-    // Only allow moves when viewing the live (latest) position
-    if (viewIndex !== null) return false
-
+    const curNode = currentNodeRef.current
     const chess = chessRef.current
+
+    // Always load the current node's FEN so chess.js is in sync
+    chess.load(curNode.fen)
+
     try {
       const moveObj = chess.move({
         from: orig,
@@ -804,8 +931,11 @@ function Dashboard() {
         playSound('move')
       }
 
-      gameHistoryRef.current = [...gameHistoryRef.current, moveObj]
-      setMoveHistory(prev => [...prev, moveObj.san])
+      // Add to tree (returns existing node if same SAN already exists)
+      const newNode = addMoveToTree(curNode, moveObj)
+      currentNodeRef.current = newNode
+      setIsViewingHistory(false)
+      bumpTree()
       syncBoard()
       cgRef.current?.set({ lastMove: [orig, dest] })
 
@@ -814,7 +944,7 @@ function Dashboard() {
       syncBoard()
       return false
     }
-  }, [syncBoard, viewIndex])
+  }, [syncBoard, bumpTree])
 
   const isPromotion = useCallback((orig, dest) => {
     const chess = chessRef.current
@@ -876,19 +1006,21 @@ function Dashboard() {
   }, [orientation])
 
   useEffect(() => {
-    if (!historyRef.current) return
-    if (viewIndex === null) {
-      // Scroll to bottom when at live position
-      historyRef.current.scrollTop = historyRef.current.scrollHeight
-    } else {
-      // Scroll to keep the active move row visible
-      const rowIdx = viewIndex === -1 ? 0 : Math.floor(viewIndex / 2)
-      const rows = historyRef.current.querySelectorAll('tbody tr')
-      if (rows[rowIdx]) {
-        rows[rowIdx].scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    const scrollContainer = (ref) => {
+      if (!ref.current) return
+      if (!isViewingHistory) {
+        ref.current.scrollTop = ref.current.scrollHeight
+      } else {
+        // Scroll to keep the active move visible
+        const active = ref.current.querySelector('[data-active="true"]')
+        if (active) {
+          active.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+        }
       }
     }
-  }, [moveHistory, viewIndex])
+    scrollContainer(historyRef)
+    scrollContainer(mobileHistoryRef)
+  }, [treeVersion, isViewingHistory])
 
   // ── Cloud eval: fetch evaluation for a given FEN ─────────────────────
   const doCloudEval = useCallback(async (fen, signal) => {
@@ -938,16 +1070,8 @@ function Dashboard() {
 
   // Compute the FEN for the currently viewed position
   const viewedFen = useMemo(() => {
-    if (viewIndex === null) return chessRef.current.fen()
-    if (viewIndex === -1) return new Chess().fen()
-    const chess = new Chess()
-    const history = gameHistoryRef.current
-    for (let i = 0; i <= viewIndex && i < history.length; i++) {
-      const m = history[i]
-      chess.move({ from: m.from, to: m.to, promotion: m.promotion || undefined })
-    }
-    return chess.fen()
-  }, [viewIndex, moveHistory]) // eslint-disable-line react-hooks/exhaustive-deps
+    return currentNodeRef.current.fen
+  }, [treeVersion, isViewingHistory]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Engine toggle: fetch or clear ─────────────────────────────────────
   useEffect(() => {
@@ -1069,9 +1193,10 @@ function Dashboard() {
 
   const resetBoard = () => {
     chessRef.current = new Chess()
-    gameHistoryRef.current = []
-    setMoveHistory([])
-    setViewIndex(null)
+    moveTreeRef.current = createRootNode()
+    currentNodeRef.current = moveTreeRef.current
+    setIsViewingHistory(false)
+    bumpTree()
     setPromotionPending(null)
     setEvalInfo(null)
     setBestMove(null)
@@ -1097,120 +1222,86 @@ function Dashboard() {
   }
 
   const undoMove = () => {
-    // If viewing a past position, jump to live first
-    if (viewIndex !== null) {
-      setViewIndex(null)
-      syncBoard()
-      return
-    }
-    const undone = chessRef.current.undo()
-    if (undone) {
-      gameHistoryRef.current = gameHistoryRef.current.slice(0, -1)
-      setMoveHistory(prev => prev.slice(0, -1))
-      syncBoard()
+    const curNode = currentNodeRef.current
+    // If at root, nothing to undo
+    if (!curNode.parent) return
+
+    // Remove the current node from its parent's children
+    const parent = curNode.parent
+    const idx = parent.children.indexOf(curNode)
+    if (idx !== -1) parent.children.splice(idx, 1)
+
+    // Move back to parent
+    currentNodeRef.current = parent
+    chessRef.current.load(parent.fen)
+    setIsViewingHistory(false)
+    bumpTree()
+    syncBoard()
+    if (parent.moveObj) {
+      cgRef.current?.set({ lastMove: [parent.moveObj.from, parent.moveObj.to] })
+    } else {
       cgRef.current?.set({ lastMove: undefined })
     }
   }
 
-  // ── Move navigation ─────────────────────────────────────────────────
-  // Reconstruct position at a given half-move index by replaying moves
-  const replayToIndex = useCallback((idx) => {
-    const history = gameHistoryRef.current
-    const chess = new Chess()
-    let lastFrom = null
-    let lastTo = null
-
-    for (let i = 0; i <= idx && i < history.length; i++) {
-      const m = history[i]
-      chess.move({ from: m.from, to: m.to, promotion: m.promotion || undefined })
-      lastFrom = m.from
-      lastTo = m.to
+  // ── Move navigation (tree-based) ──────────────────────────────────────
+  // Navigate to a specific tree node
+  const navigateToNode = useCallback((node) => {
+    currentNodeRef.current = node
+    chessRef.current.load(node.fen)
+    const lastMove = node.moveObj ? [node.moveObj.from, node.moveObj.to] : undefined
+    if (node.children.length === 0) {
+      // At end of line — show as live/playable
+      setIsViewingHistory(false)
+      syncBoard()
+      cgRef.current?.set({ lastMove })
+    } else {
+      // In the middle of a line — show as history but allow moves
+      setIsViewingHistory(true)
+      showPosition(node.fen, lastMove)
     }
+    bumpTree()
+  }, [syncBoard, showPosition, bumpTree])
 
-    return { fen: chess.fen(), lastMove: lastFrom ? [lastFrom, lastTo] : undefined }
-  }, [])
-
-  const isAtLive = viewIndex === null
+  const isAtLive = !isViewingHistory
 
   const goToStart = useCallback(() => {
-    if (moveHistory.length === 0) return
-    setViewIndex(-1)
-    const startFen = new Chess().fen()
-    showPosition(startFen, undefined)
+    const root = moveTreeRef.current
+    if (root.children.length === 0) return
+    navigateToNode(root)
     playSound('move')
-  }, [moveHistory.length, showPosition])
+  }, [navigateToNode])
 
   const goBack = useCallback(() => {
-    if (moveHistory.length === 0) return
-    const current = viewIndex === null ? moveHistory.length - 1 : viewIndex
-    if (current <= -1) return
-
-    const newIdx = current - 1
-    setViewIndex(newIdx)
-
-    if (newIdx === -1) {
-      showPosition(new Chess().fen(), undefined)
-    } else {
-      const { fen, lastMove } = replayToIndex(newIdx)
-      showPosition(fen, lastMove)
-    }
+    const curNode = currentNodeRef.current
+    if (!curNode.parent) return // already at root
+    navigateToNode(curNode.parent)
     playSound('move')
-  }, [viewIndex, moveHistory.length, showPosition, replayToIndex])
+  }, [navigateToNode])
 
   const goForward = useCallback(() => {
-    if (moveHistory.length === 0) return
-    if (viewIndex === null) return // already at live
-
-    const newIdx = viewIndex + 1
-    const history = gameHistoryRef.current
-    if (newIdx >= moveHistory.length - 1) {
-      // Return to live position
-      setViewIndex(null)
-      syncBoard()
-      // Restore last move highlight from the game
-      if (history.length > 0) {
-        const last = history[history.length - 1]
-        cgRef.current?.set({ lastMove: [last.from, last.to] })
-      }
-    } else {
-      setViewIndex(newIdx)
-      const { fen, lastMove } = replayToIndex(newIdx)
-      showPosition(fen, lastMove)
-    }
-    playSoundForMoveObj(history[newIdx])
-  }, [viewIndex, moveHistory.length, syncBoard, showPosition, replayToIndex])
+    const curNode = currentNodeRef.current
+    if (curNode.children.length === 0) return // no moves ahead
+    const nextNode = curNode.children[0] // follow mainline
+    navigateToNode(nextNode)
+    playSoundForMoveObj(nextNode.moveObj)
+  }, [navigateToNode])
 
   const goToEnd = useCallback(() => {
-    if (viewIndex === null) return
-    setViewIndex(null)
-    syncBoard()
-    // Restore last move highlight
-    const history = gameHistoryRef.current
-    if (history.length > 0) {
-      const last = history[history.length - 1]
-      cgRef.current?.set({ lastMove: [last.from, last.to] })
-      playSoundForMoveObj(last)
+    let node = currentNodeRef.current
+    if (node.children.length === 0) return // already at end
+    while (node.children.length > 0) {
+      node = node.children[0] // follow mainline
     }
-  }, [viewIndex, syncBoard])
+    navigateToNode(node)
+    playSoundForMoveObj(node.moveObj)
+  }, [navigateToNode])
 
-  const goToMove = useCallback((idx) => {
-    if (idx < 0 || idx >= moveHistory.length) return
-    const history = gameHistoryRef.current
-    if (idx === moveHistory.length - 1) {
-      // Clicked on the last move — return to live
-      setViewIndex(null)
-      syncBoard()
-      if (history.length > 0) {
-        const last = history[history.length - 1]
-        cgRef.current?.set({ lastMove: [last.from, last.to] })
-      }
-    } else {
-      setViewIndex(idx)
-      const { fen, lastMove } = replayToIndex(idx)
-      showPosition(fen, lastMove)
-    }
-    playSoundForMoveObj(history[idx])
-  }, [moveHistory.length, syncBoard, showPosition, replayToIndex])
+  // Navigate to a specific node (used by clicking moves in notation)
+  const goToNode = useCallback((node) => {
+    navigateToNode(node)
+    playSoundForMoveObj(node.moveObj)
+  }, [navigateToNode])
 
   // ── Keyboard navigation ─────────────────────────────────────────────
   useEffect(() => {
@@ -1297,16 +1388,17 @@ function Dashboard() {
       )}
 
       {/* ── Header ────────────────────────────────────────────────────────── */}
-      <header className="sticky top-0 z-30 flex h-14 min-h-[52px] items-center justify-between border-b border-border bg-background/80 backdrop-blur-md px-4 md:px-6 shrink-0">
-        <div className="flex items-center gap-2 md:gap-3">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-md bg-muted/50 border border-border flex items-center justify-center">
-              <Crown size={16} className="text-foreground" strokeWidth={2} />
+      <header className="sticky top-0 z-30 flex h-11 sm:h-14 items-center justify-between border-b border-border bg-background/80 backdrop-blur-md px-3 sm:px-4 md:px-6 shrink-0">
+        <div className="flex items-center gap-1.5 sm:gap-2 md:gap-3">
+          <div className="flex items-center gap-1.5 sm:gap-2">
+            <div className="w-6 h-6 sm:w-8 sm:h-8 rounded-md bg-muted/50 border border-border flex items-center justify-center">
+              <Crown size={14} className="text-foreground sm:hidden" strokeWidth={2} />
+              <Crown size={16} className="text-foreground hidden sm:block" strokeWidth={2} />
             </div>
-            <span className="text-base font-semibold text-foreground tracking-tight">RepertoireLab</span>
+            <span className="text-sm sm:text-base font-semibold text-foreground tracking-tight">RepertoireLab</span>
           </div>
           {queryUser && (
-            <div className="flex items-center gap-1.5 rounded-md border border-border bg-card/50 px-2.5 py-1 ml-2">
+            <div className="flex items-center gap-1.5 rounded-md border border-border bg-card/50 px-2 py-0.5 sm:px-2.5 sm:py-1 ml-1.5 sm:ml-2">
               <User size={12} className="text-muted-foreground" strokeWidth={2} />
               <span className="text-[10px] font-medium text-foreground uppercase tracking-wider">{queryUser}</span>
               {queryColor && (
@@ -1330,7 +1422,7 @@ function Dashboard() {
           <Button
             variant="outline"
             size="sm"
-            className="h-8 w-8 p-0"
+            className="h-7 w-7 sm:h-8 sm:w-8 p-0"
             onClick={toggleColorMode}
             title={colorMode === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
           >
@@ -1483,7 +1575,7 @@ function Dashboard() {
       <div className="flex flex-1 min-h-0 relative z-10">
 
         {/* ── Left sidebar (Opening tree + game stats) ──────────────────────── */}
-        <div className="hidden xl:flex flex-col w-[280px] shrink-0 sticky top-14 self-start h-[calc(100vh-3.5rem)] overflow-y-auto border-r border-border bg-background/50 backdrop-blur-sm">
+        <div className="hidden xl:flex flex-col w-[280px] shrink-0 sticky top-11 sm:top-14 self-start h-[calc(100vh-2.75rem)] sm:h-[calc(100vh-3.5rem)] overflow-y-auto border-r border-border bg-background/50 backdrop-blur-sm">
           <div className="p-4 space-y-4">
 
             {/* Hero badge */}
@@ -1650,7 +1742,7 @@ function Dashboard() {
 
         {/* ── Center — Board ───────────────────────────────────────────────── */}
         <div className="flex-1 overflow-y-auto min-w-0">
-          <div className="flex flex-col items-center justify-center px-4 md:px-6 py-6 min-h-[calc(100vh-3.5rem)]">
+          <div className="flex flex-col items-center px-4 md:px-6 py-6">
 
             {/* Controls bar */}
             <div className="flex items-center gap-1.5 mb-4">
@@ -1724,7 +1816,7 @@ function Dashboard() {
                   size="sm"
                   className="h-8 w-8 p-0"
                   onClick={goToStart}
-                  disabled={viewIndex === -1}
+                  disabled={!currentNodeRef.current.parent}
                   title="Go to start (Home)"
                 >
                   <ChevronsLeft size={14} strokeWidth={2} />
@@ -1734,7 +1826,7 @@ function Dashboard() {
                   size="sm"
                   className="h-8 w-8 p-0"
                   onClick={goBack}
-                  disabled={viewIndex === -1}
+                  disabled={!currentNodeRef.current.parent}
                   title="Previous move (←)"
                 >
                   <ChevronLeft size={14} strokeWidth={2} />
@@ -1761,7 +1853,7 @@ function Dashboard() {
                 </Button>
                 {!isAtLive && (
                   <span className="text-[10px] text-muted-foreground font-mono ml-2">
-                    {viewIndex === -1 ? 'Start' : `Move ${Math.floor(viewIndex / 2) + 1}${viewIndex % 2 === 0 ? '.' : '...'}`}
+                    {!currentNodeRef.current.parent ? 'Start' : `Move ${Math.ceil(moveHistory.length / 2)}${moveHistory.length % 2 === 1 ? '.' : '...'}`}
                   </span>
                 )}
               </div>
@@ -1845,7 +1937,7 @@ function Dashboard() {
                     }`}
                   >
                     <TabIcon size={14} strokeWidth={2} />
-                    <span className="hidden xs:inline sm:inline">{label}</span>
+                    <span className="text-[11px] sm:text-xs">{label}</span>
                   </button>
                 ))}
               </div>
@@ -1896,15 +1988,18 @@ function Dashboard() {
                               <button
                                 key={move.san}
                                 onClick={() => {
-                                  if (viewIndex !== null) return
                                   const chess = chessRef.current
                                   const cg = cgRef.current
                                   if (!chess || !cg) return
                                   try {
+                                    // Load the current position FEN so chess.js can validate
+                                    chess.load(currentNodeRef.current.fen)
                                     const result = chess.move(move.san)
                                     if (!result) return
-                                    gameHistoryRef.current = [...gameHistoryRef.current, result]
-                                    setMoveHistory(prev => [...prev, result.san])
+                                    const newNode = addMoveToTree(currentNodeRef.current, result)
+                                    currentNodeRef.current = newNode
+                                    setIsViewingHistory(false)
+                                    bumpTree()
                                     syncBoard()
                                     playSound(result.captured ? 'capture' : 'move')
                                   } catch { /* ignore invalid */ }
@@ -1970,7 +2065,7 @@ function Dashboard() {
                       </div>
                     </CardHeader>
                     <CardContent className="p-0">
-                      {moveHistory.length === 0 ? (
+                      {notationTokens.length === 0 ? (
                         <div className="flex flex-col items-center justify-center py-8 gap-2 text-center px-4">
                           <div className="w-10 h-10 rounded-md bg-muted/50 border border-border flex items-center justify-center">
                             <Swords size={18} className="text-muted-foreground" strokeWidth={2} />
@@ -1980,52 +2075,42 @@ function Dashboard() {
                         </div>
                       ) : (
                         <>
-                          <div className="overflow-y-auto max-h-[300px]" style={{ WebkitOverflowScrolling: 'touch' }}>
-                            <table className="w-full text-left">
-                              <thead>
-                                <tr className="border-b border-border bg-muted/30">
-                                  <th className="h-8 px-4 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider w-12">#</th>
-                                  <th className="h-8 px-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">White</th>
-                                  <th className="h-8 px-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Black</th>
-                                </tr>
-                              </thead>
-                              <tbody className="divide-y divide-border">
-                                {movePairs.map((pair, i) => {
-                                  const whiteIdx = i * 2
-                                  const blackIdx = i * 2 + 1
-                                  const activeIdx = viewIndex === null ? moveHistory.length - 1 : viewIndex
-                                  const isActiveWhite = activeIdx === whiteIdx
-                                  const isActiveBlack = activeIdx === blackIdx
+                          <div ref={mobileHistoryRef} className="overflow-y-auto max-h-[300px] px-3 py-2" style={{ WebkitOverflowScrolling: 'touch' }}>
+                            <div className="flex flex-wrap items-baseline gap-x-1 gap-y-0.5 text-sm font-mono">
+                              {notationTokens.map((token, i) => {
+                                if (token.type === 'moveNumber') {
                                   return (
-                                    <tr key={pair.num} className="group hover:bg-muted/30 transition-colors">
-                                      <td className="px-4 py-2 text-xs text-muted-foreground font-mono tabular-nums">{pair.num}.</td>
-                                      <td
-                                        className={`px-3 py-2 text-sm font-mono cursor-pointer select-none transition-colors ${
-                                          isActiveWhite
-                                            ? 'text-foreground font-semibold bg-accent/50'
-                                            : 'text-foreground/80 hover:bg-muted/40'
-                                        }`}
-                                        onClick={() => goToMove(whiteIdx)}
-                                      >
-                                        {pair.white}
-                                      </td>
-                                      <td
-                                        className={`px-3 py-2 text-sm font-mono transition-colors ${
-                                          pair.black
-                                            ? isActiveBlack
-                                              ? 'text-foreground font-semibold bg-accent/50 cursor-pointer select-none'
-                                              : 'text-foreground/80 hover:bg-muted/40 cursor-pointer select-none'
-                                            : ''
-                                        }`}
-                                        onClick={pair.black ? () => goToMove(blackIdx) : undefined}
-                                      >
-                                        {pair.black || ''}
-                                      </td>
-                                    </tr>
+                                    <span key={`mn-${i}`} className="text-xs text-muted-foreground tabular-nums">
+                                      {token.num}{token.dots}
+                                    </span>
                                   )
-                                })}
-                              </tbody>
-                            </table>
+                                }
+                                if (token.type === 'move') {
+                                  const isActive = token.node === currentNodeRef.current
+                                  return (
+                                    <span
+                                      key={`m-${i}`}
+                                      data-active={isActive}
+                                      className={`cursor-pointer select-none rounded px-1 py-0.5 transition-colors ${
+                                        isActive
+                                          ? 'text-foreground font-semibold bg-accent/50'
+                                          : 'text-foreground/80 hover:bg-muted/40'
+                                      }`}
+                                      onClick={() => goToNode(token.node)}
+                                    >
+                                      {token.node.san}
+                                    </span>
+                                  )
+                                }
+                                if (token.type === 'varStart') {
+                                  return <span key={`vs-${i}`} className="text-muted-foreground/50 text-xs">(</span>
+                                }
+                                if (token.type === 'varEnd') {
+                                  return <span key={`ve-${i}`} className="text-muted-foreground/50 text-xs">)</span>
+                                }
+                                return null
+                              })}
+                            </div>
                           </div>
                           <div className="px-4 py-3 border-t border-border bg-muted/20">
                             <span className="text-xs text-muted-foreground">
@@ -2117,7 +2202,7 @@ function Dashboard() {
                               <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider">Principal variations</p>
                               {pvLinesSan.map((line, lineIdx) => (
                                 <div key={lineIdx} className="space-y-1">
-                                  <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1 sm:gap-1.5">
                                     <span className={`text-xs font-mono font-semibold px-1.5 py-0.5 rounded border ${
                                       lineIdx === 0
                                         ? 'bg-accent text-foreground border-border'
@@ -2139,7 +2224,7 @@ function Dashboard() {
                                             : 'text-muted-foreground'
                                         }`}
                                       >
-                                        {i % 2 === 0 && <span className="text-muted-foreground/50 mr-0.5">{Math.floor(i / 2) + Math.ceil((viewIndex === null ? moveHistory.length : viewIndex + 1) / 2) + 1}.</span>}
+                                        {i % 2 === 0 && <span className="text-muted-foreground/50 mr-0.5">{Math.floor(i / 2) + Math.ceil(moveHistory.length / 2) + 1}.</span>}
                                         {san}
                                       </span>
                                     ))}
@@ -2236,7 +2321,7 @@ function Dashboard() {
         </div>
 
         {/* ── Right sidebar (notation + resources) ─────────────────────────── */}
-        <div className="hidden xl:flex flex-col w-[320px] shrink-0 sticky top-14 self-start h-[calc(100vh-3.5rem)] overflow-y-auto border-l border-border bg-background/50 backdrop-blur-sm">
+        <div className="hidden xl:flex flex-col w-[320px] shrink-0 sticky top-11 sm:top-14 self-start h-[calc(100vh-2.75rem)] sm:h-[calc(100vh-3.5rem)] overflow-y-auto border-l border-border bg-background/50 backdrop-blur-sm">
           <div className="p-4 space-y-4">
 
             {/* Engine Analysis Card */}
@@ -2343,7 +2428,7 @@ function Dashboard() {
                                       : 'text-muted-foreground'
                                   }`}
                                 >
-                                  {i % 2 === 0 && <span className="text-muted-foreground/50 mr-0.5">{Math.floor(i / 2) + Math.ceil((viewIndex === null ? moveHistory.length : viewIndex + 1) / 2) + 1}.</span>}
+                                  {i % 2 === 0 && <span className="text-muted-foreground/50 mr-0.5">{Math.floor(i / 2) + Math.ceil(moveHistory.length / 2) + 1}.</span>}
                                   {san}
                                 </span>
                               ))}
@@ -2368,7 +2453,7 @@ function Dashboard() {
                 </div>
               </CardHeader>
               <CardContent className="p-0">
-                {moveHistory.length === 0 ? (
+                {notationTokens.length === 0 ? (
                   <div className="flex flex-col items-center justify-center py-8 gap-2 text-center px-4">
                     <div className="w-10 h-10 rounded-md bg-muted/50 border border-border flex items-center justify-center">
                       <Swords size={18} className="text-muted-foreground" strokeWidth={2} />
@@ -2378,53 +2463,42 @@ function Dashboard() {
                   </div>
                 ) : (
                   <>
-                    <div ref={historyRef} className="overflow-y-auto max-h-[340px]" style={{ WebkitOverflowScrolling: 'touch' }}>
-                      <table className="w-full text-left">
-                        <thead>
-                          <tr className="border-b border-border bg-muted/30">
-                            <th className="h-8 px-4 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider w-12">#</th>
-                            <th className="h-8 px-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">White</th>
-                            <th className="h-8 px-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">Black</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-border">
-                          {movePairs.map((pair, i) => {
-                            const whiteIdx = i * 2
-                            const blackIdx = i * 2 + 1
-                            // Determine which move is "active" (currently viewed)
-                            const activeIdx = viewIndex === null ? moveHistory.length - 1 : viewIndex
-                            const isActiveWhite = activeIdx === whiteIdx
-                            const isActiveBlack = activeIdx === blackIdx
+                    <div ref={historyRef} className="overflow-y-auto max-h-[340px] px-3 py-2" style={{ WebkitOverflowScrolling: 'touch' }}>
+                      <div className="flex flex-wrap items-baseline gap-x-1 gap-y-0.5 text-sm font-mono">
+                        {notationTokens.map((token, i) => {
+                          if (token.type === 'moveNumber') {
                             return (
-                              <tr key={pair.num} className="group hover:bg-muted/30 transition-colors">
-                                <td className="px-4 py-2 text-xs text-muted-foreground font-mono tabular-nums">{pair.num}.</td>
-                                <td
-                                  className={`px-3 py-2 text-sm font-mono cursor-pointer select-none transition-colors ${
-                                    isActiveWhite
-                                      ? 'text-foreground font-semibold bg-accent/50'
-                                      : 'text-foreground/80 hover:bg-muted/40'
-                                  }`}
-                                  onClick={() => goToMove(whiteIdx)}
-                                >
-                                  {pair.white}
-                                </td>
-                                <td
-                                  className={`px-3 py-2 text-sm font-mono transition-colors ${
-                                    pair.black
-                                      ? isActiveBlack
-                                        ? 'text-foreground font-semibold bg-accent/50 cursor-pointer select-none'
-                                        : 'text-foreground/80 hover:bg-muted/40 cursor-pointer select-none'
-                                      : ''
-                                  }`}
-                                  onClick={pair.black ? () => goToMove(blackIdx) : undefined}
-                                >
-                                  {pair.black || ''}
-                                </td>
-                              </tr>
+                              <span key={`mn-${i}`} className="text-xs text-muted-foreground tabular-nums">
+                                {token.num}{token.dots}
+                              </span>
                             )
-                          })}
-                        </tbody>
-                      </table>
+                          }
+                          if (token.type === 'move') {
+                            const isActive = token.node === currentNodeRef.current
+                            return (
+                              <span
+                                key={`m-${i}`}
+                                data-active={isActive}
+                                className={`cursor-pointer select-none rounded px-1 py-0.5 transition-colors ${
+                                  isActive
+                                    ? 'text-foreground font-semibold bg-accent/50'
+                                    : 'text-foreground/80 hover:bg-muted/40'
+                                }`}
+                                onClick={() => goToNode(token.node)}
+                              >
+                                {token.node.san}
+                              </span>
+                            )
+                          }
+                          if (token.type === 'varStart') {
+                            return <span key={`vs-${i}`} className="text-muted-foreground/50 text-xs">(</span>
+                          }
+                          if (token.type === 'varEnd') {
+                            return <span key={`ve-${i}`} className="text-muted-foreground/50 text-xs">)</span>
+                          }
+                          return null
+                        })}
+                      </div>
                     </div>
                     <div className="px-4 py-3 border-t border-border bg-muted/20">
                       <span className="text-xs text-muted-foreground">
@@ -2479,16 +2553,17 @@ function Dashboard() {
                         <button
                           key={move.san}
                           onClick={() => {
-                            // Play this move on the board
-                            if (viewIndex !== null) return // can't play while viewing history
                             const chess = chessRef.current
                             const cg = cgRef.current
                             if (!chess || !cg) return
                             try {
+                              chess.load(currentNodeRef.current.fen)
                               const result = chess.move(move.san)
                               if (!result) return
-                              gameHistoryRef.current = [...gameHistoryRef.current, result]
-                              setMoveHistory(prev => [...prev, result.san])
+                              const newNode = addMoveToTree(currentNodeRef.current, result)
+                              currentNodeRef.current = newNode
+                              setIsViewingHistory(false)
+                              bumpTree()
                               syncBoard()
                               playSound(result.captured ? 'capture' : 'move')
                             } catch { /* ignore invalid */ }
