@@ -163,6 +163,11 @@ h6 {
   }
 }
 
+/* ── Ensure touch events reach Chessground on mobile ───────────────── */
+.cg-wrap {
+  touch-action: none;
+}
+
 .board-resize-wrapper:hover .board-resize-handle {
   opacity: 1;
 }

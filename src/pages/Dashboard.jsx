@@ -112,18 +112,18 @@ const DotPattern = () => (
   />
 )
 
-// ─── Chess.com sounds ───────────────────────────────────────────────────────────
-const SOUND_BASE = 'https://images.chesscomfiles.com/chess-themes/sounds/_MP3_/default'
+// ─── Lichess sounds ─────────────────────────────────────────────────────────────
+const SOUND_BASE = 'https://lichess1.org/assets/sound/standard'
 const sounds = {
-  move: `${SOUND_BASE}/move-self.mp3`,
-  capture: `${SOUND_BASE}/capture.mp3`,
-  check: `${SOUND_BASE}/move-check.mp3`,
-  castle: `${SOUND_BASE}/castle.mp3`,
-  promote: `${SOUND_BASE}/promote.mp3`,
-  gameEnd: `${SOUND_BASE}/game-end.mp3`,
-  gameStart: `${SOUND_BASE}/game-start.mp3`,
-  illegal: `${SOUND_BASE}/illegal.mp3`,
-  notify: `${SOUND_BASE}/notify.mp3`,
+  move: `${SOUND_BASE}/Move.mp3`,
+  capture: `${SOUND_BASE}/Capture.mp3`,
+  check: `${SOUND_BASE}/Check.mp3`,
+  castle: `${SOUND_BASE}/Move.mp3`,
+  promote: `${SOUND_BASE}/Confirmation.mp3`,
+  gameEnd: `${SOUND_BASE}/Victory.mp3`,
+  gameStart: `${SOUND_BASE}/Confirmation.mp3`,
+  illegal: `${SOUND_BASE}/Error.mp3`,
+  notify: `${SOUND_BASE}/GenericNotify.mp3`,
 }
 
 // Module-level volume, kept in sync with React state via volumeRef
@@ -137,6 +137,25 @@ function playSound(name) {
     audio.play().catch(() => {})
   } catch {
     // sounds are best-effort
+  }
+}
+
+// Determine and play the correct sound for a chess.js move object
+function playSoundForMoveObj(moveObj) {
+  if (!moveObj) { playSound('move'); return }
+  const chess = new Chess(moveObj.after)
+  if (chess.isCheckmate() || chess.isStalemate() || chess.isDraw()) {
+    playSound('gameEnd')
+  } else if (chess.inCheck()) {
+    playSound('check')
+  } else if (moveObj.captured) {
+    playSound('capture')
+  } else if (moveObj.flags.includes('k') || moveObj.flags.includes('q')) {
+    playSound('castle')
+  } else if (moveObj.flags.includes('p')) {
+    playSound('promote')
+  } else {
+    playSound('move')
   }
 }
 
@@ -829,7 +848,8 @@ function Dashboard() {
           dests: getLegalDests(chess),
           showDests: true,
         },
-        draggable: { showGhost: true },
+        draggable: { enabled: true, showGhost: true },
+        selectable: { enabled: true },
         animation: { enabled: true, duration: 200 },
         highlight: { lastMove: true, check: true },
         premovable: { enabled: false },
@@ -1064,7 +1084,8 @@ function Dashboard() {
         fen: chess.fen(),
         turnColor: 'white',
         movable: { free: false, color: 'white', dests: getLegalDests(chess), showDests: true },
-        draggable: { showGhost: true },
+        draggable: { enabled: true, showGhost: true },
+        selectable: { enabled: true },
         animation: { enabled: true, duration: 200 },
         highlight: { lastMove: true, check: true },
         premovable: { enabled: false },
@@ -1116,6 +1137,7 @@ function Dashboard() {
     setViewIndex(-1)
     const startFen = new Chess().fen()
     showPosition(startFen, undefined)
+    playSound('move')
   }, [moveHistory.length, showPosition])
 
   const goBack = useCallback(() => {
@@ -1132,6 +1154,7 @@ function Dashboard() {
       const { fen, lastMove } = replayToIndex(newIdx)
       showPosition(fen, lastMove)
     }
+    playSound('move')
   }, [viewIndex, moveHistory.length, showPosition, replayToIndex])
 
   const goForward = useCallback(() => {
@@ -1139,12 +1162,12 @@ function Dashboard() {
     if (viewIndex === null) return // already at live
 
     const newIdx = viewIndex + 1
+    const history = gameHistoryRef.current
     if (newIdx >= moveHistory.length - 1) {
       // Return to live position
       setViewIndex(null)
       syncBoard()
       // Restore last move highlight from the game
-      const history = gameHistoryRef.current
       if (history.length > 0) {
         const last = history[history.length - 1]
         cgRef.current?.set({ lastMove: [last.from, last.to] })
@@ -1154,6 +1177,7 @@ function Dashboard() {
       const { fen, lastMove } = replayToIndex(newIdx)
       showPosition(fen, lastMove)
     }
+    playSoundForMoveObj(history[newIdx])
   }, [viewIndex, moveHistory.length, syncBoard, showPosition, replayToIndex])
 
   const goToEnd = useCallback(() => {
@@ -1165,16 +1189,17 @@ function Dashboard() {
     if (history.length > 0) {
       const last = history[history.length - 1]
       cgRef.current?.set({ lastMove: [last.from, last.to] })
+      playSoundForMoveObj(last)
     }
   }, [viewIndex, syncBoard])
 
   const goToMove = useCallback((idx) => {
     if (idx < 0 || idx >= moveHistory.length) return
+    const history = gameHistoryRef.current
     if (idx === moveHistory.length - 1) {
       // Clicked on the last move — return to live
       setViewIndex(null)
       syncBoard()
-      const history = gameHistoryRef.current
       if (history.length > 0) {
         const last = history[history.length - 1]
         cgRef.current?.set({ lastMove: [last.from, last.to] })
@@ -1184,6 +1209,7 @@ function Dashboard() {
       const { fen, lastMove } = replayToIndex(idx)
       showPosition(fen, lastMove)
     }
+    playSoundForMoveObj(history[idx])
   }, [moveHistory.length, syncBoard, showPosition, replayToIndex])
 
   // ── Keyboard navigation ─────────────────────────────────────────────
@@ -1277,7 +1303,7 @@ function Dashboard() {
             <div className="w-8 h-8 rounded-md bg-muted/50 border border-border flex items-center justify-center">
               <Crown size={16} className="text-foreground" strokeWidth={2} />
             </div>
-            <span className="text-base font-semibold text-foreground tracking-tight">Lichess Prep</span>
+            <span className="text-base font-semibold text-foreground tracking-tight">RepertoireLab</span>
           </div>
           {queryUser && (
             <div className="flex items-center gap-1.5 rounded-md border border-border bg-card/50 px-2.5 py-1 ml-2">
