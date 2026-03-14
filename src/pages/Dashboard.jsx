@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Chessground } from 'chessground'
+import { Chessground } from 'chessgroundx'
 import { Chess } from 'chess.js'
 import {
   RotateCcw, Undo2, RefreshCw, ExternalLink,
@@ -21,9 +21,9 @@ import { Button } from '@/components/ui/button'
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
-import 'chessground/assets/chessground.base.css'
-import 'chessground/assets/chessground.brown.css'
-import 'chessground/assets/chessground.cburnett.css'
+import 'chessgroundx/assets/chessground.base.css'
+import 'chessgroundx/assets/chessground.brown.css'
+import 'chessgroundx/assets/chessground.cburnett.css'
 
 // ─── localStorage persistence ───────────────────────────────────────────────────
 const PREFS_KEY = 'chess-preferences'
@@ -1099,7 +1099,7 @@ function Dashboard() {
     }
   }, [engineOn]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Re-fetch when viewed position changes ─────────────────────────────
+  // ── Re-fetch when viewed position changes (with debounce) ───────────────────
   useEffect(() => {
     if (!engineOn) return
 
@@ -1111,12 +1111,18 @@ function Dashboard() {
     setEvalInfo(null)
     setBestMove(null)
 
-    const controller = new AbortController()
-    abortRef.current = controller
-    doCloudEval(viewedFen, controller.signal)
+    // Debounce API calls to prevent rate limiting
+    const timeoutId = setTimeout(() => {
+      const controller = new AbortController()
+      abortRef.current = controller
+      doCloudEval(viewedFen, controller.signal)
+    }, 300) // 300ms debounce
 
     return () => {
-      controller.abort()
+      clearTimeout(timeoutId)
+      if (abortRef.current) {
+        abortRef.current.abort()
+      }
     }
   }, [viewedFen, engineOn, doCloudEval])
 
