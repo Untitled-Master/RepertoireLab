@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Chessground } from 'chessground'
+import { Chessground } from 'chessgroundx'
 import { Chess } from 'chess.js'
 import {
   RotateCcw, Undo2, RefreshCw, ExternalLink,
@@ -21,9 +21,9 @@ import { Button } from '@/components/ui/button'
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
-import 'chessground/assets/chessground.base.css'
-import 'chessground/assets/chessground.brown.css'
-import 'chessground/assets/chessground.cburnett.css'
+import 'chessgroundx/assets/chessground.base.css'
+import 'chessgroundx/assets/chessground.brown.css'
+import 'chessgroundx/assets/chessground.cburnett.css'
 
 // ─── localStorage persistence ───────────────────────────────────────────────────
 const PREFS_KEY = 'chess-preferences'

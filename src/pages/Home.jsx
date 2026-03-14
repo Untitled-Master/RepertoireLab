@@ -1,7 +1,7 @@
 /* eslint-disable react/prop-types */
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Chessground } from 'chessground'
+import { Chessground } from 'chessgroundx'
 import { Chess } from 'chess.js'
 import {
   Crown, Search, ChevronRight, Zap, Timer, Gauge, Clock,
@@ -10,9 +10,9 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
-import 'chessground/assets/chessground.base.css'
-import 'chessground/assets/chessground.brown.css'
-import 'chessground/assets/chessground.cburnett.css'
+import 'chessgroundx/assets/chessground.base.css'
+import 'chessgroundx/assets/chessground.brown.css'
+import 'chessgroundx/assets/chessground.cburnett.css'
 
 // ─── Dot pattern background ─────────────────────────────────────────────────────
 const DotPattern = () => (
